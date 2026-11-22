@@ -1,14 +1,71 @@
 import { atom, read, update } from 'claude-code'
 import type { Hook, Register } from 'claude-code'
 
-import type { CostLine } from '../types'
+import type { CostLine, Rates } from '../types'
 
-// Fixed estimate set 22 Nov 2026, not a live rate. Edit to update.
-const USD_PER_GBP = 1.28
+// European Central Bank euro reference rates, published each working day.
+const ECB_URL = 'https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml'
+const REFRESH_MS = 12 * 60 * 60 * 1000
+const DEFAULT_CURRENCY = 'GBP'
+
+// Every currency the ECB publishes, plus the euro itself.
+const CURRENCIES = [
+  'GBP', 'EUR', 'USD', 'AUD', 'BRL', 'CAD', 'CHF', 'CNY', 'CZK', 'DKK', 'HKD',
+  'HUF', 'IDR', 'ILS', 'INR', 'ISK', 'JPY', 'KRW', 'MXN', 'MYR', 'NOK', 'NZD',
+  'PHP', 'PLN', 'RON', 'SEK', 'SGD', 'THB', 'TRY', 'ZAR',
+]
+
+const SYMBOLS: Record<string, string> = {
+  GBP: '£', EUR: '€', USD: 'US$', JPY: '¥', CNY: 'CN¥', INR: '₹', KRW: '₩',
+  AUD: 'A$', CAD: 'C$', NZD: 'NZ$', HKD: 'HK$', SGD: 'S$', BRL: 'R$',
+  MXN: 'MX$', ILS: '₪', PHP: '₱', THB: '฿', TRY: '₺', ZAR: 'R', CHF: 'CHF ',
+  PLN: 'zł ',
+}
+
+const NO_DECIMALS = new Set(['JPY', 'KRW', 'IDR', 'HUF', 'ISK'])
 
 const line = atom({ plugin: 'cost-band', key: 'line' } as const, null)
+const currency = atom({ plugin: 'cost-band', key: 'currency' } as const, DEFAULT_CURRENCY)
+const rates = atom({ plugin: 'cost-band', key: 'rates' } as const, null)
+const ratesFailed = atom({ plugin: 'cost-band', key: 'ratesFailed' } as const, false)
 
 type Engine = Parameters<Hook<'turn.complete'>>[0]
+
+/** The flag emoji for a currency: the euro's is the EU flag, others the issuing country's. */
+export function flagFor(code: string): string {
+  const country = code === 'EUR' ? 'EU' : code.slice(0, 2)
+  return [...country].map(c => String.fromCodePoint(0x1f1e6 + c.charCodeAt(0) - 65)).join('')
+}
+
+/** Reads the ECB feed; null unless it holds a date and a positive USD rate. */
+export function parseEcb(xml: string): Rates | null {
+  const date = /time=['"](\d{4}-\d{2}-\d{2})['"]/.exec(xml)?.[1]
+  const perEur: Record<string, number> = { EUR: 1 }
+  for (const m of xml.matchAll(/currency=['"]([A-Z]{3})['"]\s+rate=['"]([\d.]+)['"]/g)) {
+    const code = m[1]
+    const value = Number(m[2])
+    if (code && Number.isFinite(value) && value > 0) perEur[code] = value
+  }
+  const usd = perEur.USD
+  if (!date || usd === undefined || !(usd > 0)) return null
+  return { date, perEur }
+}
+
+/** Converts US dollars to `code`; null when the rate is missing. */
+export function convert(usd: number, code: string, r: Rates | null): number | null {
+  if (code === 'USD') return usd
+  const usdRate = r?.perEur.USD
+  const target = r?.perEur[code]
+  if (!usdRate || !target) return null
+  return (usd / usdRate) * target
+}
+
+export function formatMoney(amount: number, code: string): string {
+  const digits = NO_DECIMALS.has(code) ? 0 : 2
+  const fixed = amount.toFixed(digits).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+  const symbol = SYMBOLS[code]
+  return symbol ? `${symbol}${fixed}` : `${fixed} ${code}`
+}
 
 async function refresh($: Engine) {
   const { cost } = await $.session.usage()
@@ -21,16 +78,51 @@ async function refresh($: Engine) {
   await update($, line, () => value)
 }
 
+async function loadRates($: Engine) {
+  const saved = await $.store.get('rates')
+  const cached = saved && typeof saved === 'object' ? (saved as { fetchedAt?: number; rates?: Rates }) : null
+  if (cached?.rates) await update($, rates, () => cached.rates ?? null)
+  const now = await $.clock.now()
+  if (cached?.rates && cached.fetchedAt && now - cached.fetchedAt < REFRESH_MS) return
+
+  try {
+    const res = await $.http.fetch(ECB_URL)
+    const parsed = res.ok ? parseEcb(res.text) : null
+    if (!parsed) throw new Error('unreadable ECB feed')
+    await $.store.set('rates', { fetchedAt: now, rates: parsed })
+    await update($, rates, () => parsed)
+    await update($, ratesFailed, () => false)
+  } catch {
+    await update($, ratesFailed, () => true)
+  }
+}
+
+async function loadCurrency($: Engine) {
+  const saved = await $.store.get('currency')
+  if (typeof saved === 'string' && CURRENCIES.includes(saved)) {
+    await update($, currency, () => saved)
+  }
+}
+
+async function chooseCurrency($: Engine, code: string) {
+  if (!CURRENCIES.includes(code)) return
+  await update($, currency, () => code)
+  await $.store.set('currency', code)
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const result = await next(e)
+    await loadCurrency($)
     await refresh($)
+    await loadRates($)
     return result
   })
 
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     await refresh($)
+    await loadRates($)
     return result
   })
 
@@ -39,14 +131,35 @@ export const register: Register = on => {
     if (e.props.hasSurvey || current === null) {
       return next(e)
     }
-    const { Box, Text } = $.ui.resolve(e)
-    const gbp = current.usd / USD_PER_GBP
-    const note = current.unknownPrice ? ' (some prices unknown)' : ''
+    const { Box, Text, Select } = $.ui.resolve(e)
+    const code = await read($, currency)
+    const r = await read($, rates)
+    const failed = await read($, ratesFailed)
+
+    const converted = convert(current.usd, code, r)
+    const shown = converted === null ? 'USD' : code
+    const amount = formatMoney(converted ?? current.usd, shown)
+    const approx = shown === 'USD' ? '' : '~'
+    const notes: string[] = []
+    if (current.unknownPrice) notes.push('some prices unknown')
+    if (converted === null) notes.push(failed ? 'rates unavailable' : 'loading rates')
+    else if (shown !== 'USD' && r) notes.push(`ECB ${r.date}`)
+    const note = notes.length > 0 ? ` (${notes.join(', ')})` : ''
+
     return (
-      <Box>
+      <Box flexDirection="row" justifyContent="space-between">
         <Text dimColor>
-          Session ~£{gbp.toFixed(2)}{note} · advisor: {current.advisor}
+          Session {approx}{amount}{note} · advisor: {current.advisor}
         </Text>
+        <Box flexDirection="row">
+          <Select
+            key="currency"
+            options={CURRENCIES.map(c => ({ value: c, label: c }))}
+            value={code}
+            onSelect={value => chooseCurrency($, value)}
+          />
+          <Text> {flagFor(code)}</Text>
+        </Box>
       </Box>
     )
   })

@@ -1,5 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
+import { convert, flagFor, formatMoney, parseEcb } from './register'
+
 const BAND = {
   plugin: 'cost-band',
   component: 'AbovePrompt',
@@ -8,58 +10,122 @@ const BAND = {
     isCollapsed: false,
     isWorking: false,
     maxRows: 3,
-    bodyColumns: 80,
+    bodyColumns: 120,
     scroll: { offset: 0, bodyRows: 3 },
+    view: {},
   },
 } as const
 
-function engine(on: any, usage: unknown, settings: unknown) {
-  on('session.usage', () => ({ value: usage }))
-  on('settings.read', () => ({ value: settings }))
+const ECB_XML = `<?xml version="1.0"?><gesmes:Envelope><Cube><Cube time='2026-11-20'>
+<Cube currency='USD' rate='1.1000'/><Cube currency='GBP' rate='0.84'/>
+<Cube currency='JPY' rate='174.35'/><Cube currency='IDR' rate='20071.37'/>
+</Cube></Cube></gesmes:Envelope>`
+
+type Setup = { usd?: number; feed?: string; ok?: boolean; store?: Record<string, unknown> }
+
+function engine(on: any, { usd = 1.1, feed = ECB_XML, ok = true, store = {} }: Setup) {
+  const calls = { fetch: 0 }
+  on('session.usage', () => ({ value: { startedAt: 0, context: {}, rateLimits: [], cost: { usd } } }))
+  on('settings.read', () => ({ value: { advisorModel: 'fable' } }))
   on('session.start', (_: unknown, e: any) => ({ cwd: e.cwd }))
+  on('clock.now', () => ({ value: 1_000_000 }))
+  on('store.get', (_: unknown, e: any) => ({ value: store[e.key] }))
+  on('store.set', (_: unknown, e: any) => {
+    store[e.key] = e.value
+    return { value: undefined }
+  })
+  on('http.fetch', () => {
+    calls.fetch += 1
+    return { value: { status: ok ? 200 : 500, ok, headers: {}, text: feed } }
+  })
+  return { calls, store }
 }
 
-test('shows cost in £ with the advisor, on every surface', async ($, on) => {
-  engine(on, { startedAt: 0, context: {}, rateLimits: [], cost: { usd: 1.28 } }, { advisorModel: 'fable' })
+async function start($: any) {
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+}
 
+async function rowText(ui: any) {
+  return (await ui.find({ type: 'Text', text: /Session/ }))?.text
+}
+
+test('defaults to pounds with the UK flag, on every surface', async ($, on) => {
+  engine(on, {})
+  await start($)
   for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...BAND, surface })
-    const row = await ui.find({ type: 'Text', text: /Session/ })
-    expect(row?.text).toBe('Session ~£1.00 · advisor: fable')
+    expect(await rowText(ui)).toBe('Session ~£0.84 (ECB 2026-11-20) · advisor: fable')
+    expect((await ui.find({ type: 'Text', text: /🇬🇧/ }))?.text).toBe(' 🇬🇧')
     await ui.unmount()
   }
 })
 
-test('bad input: no cost and no advisor setting still draws', async ($, on) => {
-  engine(on, { startedAt: 0, context: {}, rateLimits: [] }, {})
-  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-
+test('picking a currency converts, changes the flag and is remembered', async ($, on) => {
+  const { store } = engine(on, {})
+  await start($)
   const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  const row = await ui.find({ type: 'Text', text: /Session/ })
-  expect(row?.text).toBe('Session ~£0.00 · advisor: off')
+  await ui.select({ key: 'currency', value: 'JPY' })
+  expect(await rowText(ui)).toBe('Session ~¥174 (ECB 2026-11-20) · advisor: fable')
+  expect((await ui.find({ type: 'Text', text: /🇯🇵/ }))?.text).toBe(' 🇯🇵')
+  expect(store.currency).toBe('JPY')
   await ui.unmount()
 })
 
-test('unknown model price is flagged', async ($, on) => {
-  engine(on, { startedAt: 0, context: {}, rateLimits: [], cost: { usd: 2.56, hasUnknownPrice: true } }, { advisorModel: 'opus' })
-  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-
+test('a saved currency is used next session', async ($, on) => {
+  engine(on, { store: { currency: 'USD' } })
+  await start($)
   const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  const row = await ui.find({ type: 'Text', text: /Session/ })
-  expect(row?.text).toBe('Session ~£2.00 (some prices unknown) · advisor: opus')
+  expect(await rowText(ui)).toBe('Session US$1.10 · advisor: fable')
+  expect((await ui.find({ type: 'Text', text: /🇺🇸/ }))?.text).toBe(' 🇺🇸')
+  await ui.unmount()
+})
+
+test('bad input: an unreadable rate feed falls back to US dollars', async ($, on) => {
+  engine(on, { feed: '<html>Service unavailable</html>', ok: true })
+  await start($)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await rowText(ui)).toBe('Session US$1.10 (rates unavailable) · advisor: fable')
+  await ui.unmount()
+})
+
+test('bad input: a failed request falls back to US dollars', async ($, on) => {
+  engine(on, { ok: false })
+  await start($)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await rowText(ui)).toBe('Session US$1.10 (rates unavailable) · advisor: fable')
+  await ui.unmount()
+})
+
+test('rates fetched in the last 12 hours are reused, not fetched again', async ($, on) => {
+  const rates = parseEcb(ECB_XML)
+  const { calls } = engine(on, { store: { rates: { fetchedAt: 1_000_000 - 60_000, rates } } })
+  await start($)
+  expect(calls.fetch).toBe(0)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await rowText(ui)).toBe('Session ~£0.84 (ECB 2026-11-20) · advisor: fable')
   await ui.unmount()
 })
 
 test('gives way to a survey', async ($, on) => {
-  engine(on, { startedAt: 0, context: {}, rateLimits: [], cost: { usd: 1 } }, { advisorModel: 'fable' })
+  engine(on, {})
   on('ui.render', ($: any, e: any) => {
     const { Text } = $.ui.resolve(e)
     return <Text>engine</Text>
   })
-  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-
+  await start($)
   const ui = await $.ui.mount({ ...BAND, surface: 'desktop', props: { ...BAND.props, hasSurvey: true } })
-  expect((await ui.find({ type: 'Text', text: /Session/ }))).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /Session/ })).toBeUndefined()
   await ui.unmount()
+})
+
+test('helpers: flags, formatting, parsing and missing rates', async () => {
+  expect(flagFor('GBP')).toBe('🇬🇧')
+  expect(flagFor('EUR')).toBe('🇪🇺')
+  expect(flagFor('ZAR')).toBe('🇿🇦')
+  expect(formatMoney(20071.37, 'IDR')).toBe('20,071 IDR')
+  expect(formatMoney(1234.5, 'EUR')).toBe('€1,234.50')
+  expect(parseEcb('no rates here')).toBe(null)
+  expect(parseEcb("<Cube time='2026-11-20'><Cube currency='GBP' rate='0.84'/>")).toBe(null)
+  expect(convert(1, 'SEK', parseEcb(ECB_XML))).toBe(null)
+  expect(convert(2.5, 'USD', null)).toBe(2.5)
 })

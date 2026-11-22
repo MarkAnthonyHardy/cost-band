@@ -1,0 +1,5 @@
+{
+  "name": "cost-band",
+  "owner": { "name": "MarkAnthonyHardy" },
+  "plugins": [{ "name": "cost-band", "source": "./" }]
+}

@@ -3,9 +3,14 @@ import type { Hook, Register } from 'claude-code'
 
 import type { CostLine, Rates } from '../types'
 
-// European Central Bank euro reference rates, published each working day.
+// European Central Bank euro reference rates. The ECB says they are "usually
+// updated at around 16:00 CET every working day, except on TARGET closing days".
 const ECB_URL = 'https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml'
-const REFRESH_MS = 12 * 60 * 60 * 1000
+// From 15:00 UTC (16:00 CET) a weekday's rates are due.
+const ECB_DUE_HOUR_UTC = 15
+// While rates are due but not yet fetched, try at most hourly; the same timer
+// keeps an idle session's rates current.
+const RETRY_MS = 60 * 60 * 1000
 const DEFAULT_CURRENCY = 'GBP'
 
 // Every currency the ECB publishes, plus the euro itself.
@@ -51,6 +56,14 @@ export function parseEcb(xml: string): Rates | null {
   return { date, perEur }
 }
 
+/** The date of the newest ECB rates due by `now`: today from 15:00 UTC, else the working day before. */
+export function latestEcbDate(now: number): string {
+  const d = new Date(now)
+  if (d.getUTCHours() < ECB_DUE_HOUR_UTC) d.setUTCDate(d.getUTCDate() - 1)
+  while (d.getUTCDay() === 0 || d.getUTCDay() === 6) d.setUTCDate(d.getUTCDate() - 1)
+  return d.toISOString().slice(0, 10)
+}
+
 /** Converts US dollars to `code`; null when the rate is missing. */
 export function convert(usd: number, code: string, r: Rates | null): number | null {
   if (code === 'USD') return usd
@@ -83,7 +96,8 @@ async function loadRates($: Engine) {
   const cached = saved && typeof saved === 'object' ? (saved as { fetchedAt?: number; rates?: Rates }) : null
   if (cached?.rates) await update($, rates, () => cached.rates ?? null)
   const now = await $.clock.now()
-  if (cached?.rates && cached.fetchedAt && now - cached.fetchedAt < REFRESH_MS) return
+  if (cached?.rates && cached.rates.date >= latestEcbDate(now)) return
+  if (cached?.fetchedAt && now - cached.fetchedAt < RETRY_MS) return
 
   try {
     const res = await $.http.fetch(ECB_URL)
@@ -116,6 +130,9 @@ export const register: Register = on => {
     await loadCurrency($)
     await refresh($)
     await loadRates($)
+    $.clock.every(RETRY_MS, () => {
+      loadRates($).catch(() => undefined)
+    })
     return result
   })
 

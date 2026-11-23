@@ -1,1 +1,1 @@
-{ "name": "cost-band", "version": "0.1.0", "description": "Shows this session's cost (US$ and estimated £) and the advisor setting above the message box", "types": "./types/index.d.ts" }
+{ "name": "cost-band", "version": "0.2.0", "description": "Shows this session's cost in your chosen currency, at the ECB's daily rates, and the advisor setting above the message box", "types": "./types/index.d.ts" }

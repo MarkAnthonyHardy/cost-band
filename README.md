@@ -37,8 +37,13 @@ claude plugin install cost-band --marketplace MarkAnthonyHardy/cost-band
 ## Exchange rates
 
 Rates come from the European Central Bank's daily euro reference rates
-(<https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml>), fetched at most
-every 12 hours. The row shows the ECB date of the rates in use. The currencies on
+(<https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml>). The ECB says
+they are usually updated at around 16:00 CET every working day, except on TARGET
+closing days. The mod fetches each working day's rates once they are due (from
+15:00 UTC), checking at the start of a session, after each turn and hourly while
+a session sits idle. If the day's rates aren't out yet, or it is a TARGET
+holiday, it tries again at most once an hour. The row shows the ECB date of the
+rates in use. The currencies on
 offer are the euro plus the 29 others the ECB publishes. US dollars need no
 conversion. If the rates can't be fetched, the row falls back to US dollars and
 says "(rates unavailable)".
